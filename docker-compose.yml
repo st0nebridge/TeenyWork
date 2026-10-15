@@ -1,0 +1,45 @@
+services:
+  challenger:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: teenywork:local
+    container_name: c2a-challenger
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      C2A_BIND_ADDRESS: 0.0.0.0:8081
+      C2A_ACTIVITY_LEDGER: /var/lib/c2a/activity.jsonl
+      C2A_CONFIG_FILE: /var/lib/c2a/config.json
+      C2A_POOL_HOST: public-pool.io:14333
+      C2A_POOL_TLS: "true"
+      C2A_SHARE_LEDGER: /var/lib/c2a/shares.jsonl
+    ports:
+      - "127.0.0.1:18181:8081"
+    volumes:
+      - challenger-data:/var/lib/c2a
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 512m
+    cpus: 1.0
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8081/api/pool"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  challenger-data:

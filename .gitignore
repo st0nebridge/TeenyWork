@@ -1,0 +1,37 @@
+# Build artifacts
+target/
+node_modules/
+vendor/
+dist/
+build/
+/wasm-challenger.wasm
+__pycache__/
+*.py[cod]
+.profiles/
+.env
+.env.*
+!.env.example
+*.log
+tmp/
+cache/
+secrets/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Documentation (working files)
+IDEA.md
+IDEA2.md
+IDEA3.md
+PLAN.md
+
+# Archive
+.archive/
+browser/*
+!browser/challenger.js
+!browser/controller.js
+!browser/index.html

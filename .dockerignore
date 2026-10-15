@@ -1,0 +1,16 @@
+.git
+.profiles
+.archive
+node_modules
+target
+__pycache__
+**/__pycache__
+*.py[cod]
+.env
+.env.*
+*.wasm
+/browser/test-wasm.html
+/browser/wasm_bindgen.js
+/test-*
+/test_*
+*.tar.gz

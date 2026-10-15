@@ -1,0 +1,13 @@
+[package]
+name = "c2a-challenger"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dev-dependencies]
+# The reference SHA-256d the midstate search is tested against.
+sha2 = "0.10"

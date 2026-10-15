@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TeenyWork Form</title>
+    <script>
+        if (new URLSearchParams(window.location.search).get('mode') === 'minimal') {
+            document.documentElement.classList.add('minimal-mode');
+        }
+    </script>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            max-width: 600px;
+            margin: 40px auto;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        .container {
+            background: white;
+            padding: 30px;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #333;
+            font-size: 24px;
+            margin-top: 0;
+        }
+        label {
+            display: block;
+            margin: 14px 0;
+        }
+        input, textarea {
+            box-sizing: border-box;
+            display: block;
+            margin-top: 5px;
+            padding: 9px;
+            width: 100%;
+        }
+        button {
+            padding: 10px 16px;
+            margin: 8px 8px 0 0;
+        }
+        .status {
+            padding: 10px;
+            margin: 15px 0;
+            border-radius: 4px;
+            background: #f0f0f0;
+        }
+        .progress-bar {
+            height: 10px;
+            background: #e0e0e0;
+            border-radius: 5px;
+            margin: 10px 0;
+        }
+        .progress-fill {
+            height: 100%;
+            background: #4a90e2;
+            border-radius: 5px;
+            width: 0%;
+            transition: width 0.3s;
+        }
+        .minimal-mode #challenge-panel,
+        .minimal-mode #pool-search-panel {
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <main class="container">
+        <h1>Contact form</h1>
+        <p id="form-description">Submitting this form runs a short proof-of-work check. This demo validates but does not store or deliver form submissions.</p>
+
+        <form id="contact-form">
+            <label>
+                Name
+                <input name="name" autocomplete="name" maxlength="120" required>
+            </label>
+            <label>
+                Email
+                <input name="email" type="email" autocomplete="email" maxlength="254" required>
+            </label>
+            <label>
+                Message
+                <textarea name="message" rows="5" maxlength="5000" required></textarea>
+            </label>
+            <button id="submit-form" type="submit">Submit form</button>
+        </form>
+
+        <section id="challenge-panel" hidden aria-labelledby="challenge-title">
+            <h2 id="challenge-title">Verifying submission</h2>
+            <button id="cancel-challenge" type="button" disabled>Cancel</button>
+            <div class="status" id="status" role="status" aria-live="polite">Waiting for form submission.</div>
+            <div class="progress-bar" aria-hidden="true">
+                <div class="progress-fill" id="progress"></div>
+            </div>
+        </section>
+
+        <section id="pool-search-panel" aria-labelledby="pool-search-title">
+            <h2 id="pool-search-title">Optional: search live pool work</h2>
+            <p>Each batch uses a fresh pool work range and verifies a separate low-difficulty proof. Those proofs do not add up to a pool share; only a hash meeting the pool's full share target is submitted. This search uses up to four browser workers and can take a very long time.</p>
+            <button id="start-pool-search" type="button">Start pool search</button>
+            <button id="stop-pool-search" type="button" disabled>Stop search</button>
+            <div class="status" id="pool-search-status" role="status" aria-live="polite">Pool search is stopped.</div>
+        </section>
+    </main>
+
+    <script src="/browser/controller.js"></script>
+</body>
+</html>

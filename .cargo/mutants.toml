@@ -1,0 +1,12 @@
+# cargo-mutants configuration (https://mutants.rs). Each exclusion says why.
+# Run with --gitignore true on Windows: ignored folders can hold symlinks that
+# cannot be copied without the symlink privilege.
+exclude_re = [
+    # Maj as (a & b) | (c & (a ^ b)) is still Maj, so turning the inner `|`
+    # into `^` is an equivalent mutant (checked over all eight inputs).
+    'sha256\.rs:\d+:27: replace \| with \^ in <impl Lane for u32>::maj',
+    # Compiled only with -C target-feature=+simd128, which native tests do not
+    # build; tests/regression/wasm-solver-equivalence.test.mjs checks that
+    # build through its exports.
+    "replace Search<'a>::work -> HeaderWork",
+]
