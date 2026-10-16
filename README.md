@@ -34,7 +34,7 @@ All settings are environment variables. The names keep the project's original `C
 | `C2A_API_KEY` | unset | Bearer key for `/admin/config`, `/admin/activity` and elevated (high-confidence bot) challenges; unset disables those. The server refuses to start if it is set but empty, or is the `.env.example` placeholder. A key shorter than 32 characters only logs a warning. |
 | `C2A_POOL_HOST` | `public-pool.io:14333` | Stratum V1 pool as `host:port`. |
 | `C2A_POOL_TLS` | `true` | Use TLS to the pool. Set `false` to connect in plaintext. Only `true` and `false` (in any case) are accepted; any other value stops startup. |
-| `C2A_POOL_USERNAME` | BIP 173's example address | Initial payout address when no configuration file exists yet. The pool stays off until an address is saved through `/admin/config`. |
+| `C2A_POOL_USERNAME` | `UNSET-PAYOUT-ADDRESS` | Initial payout address when no configuration file exists yet. The pool stays off until an address is saved through `/admin/config`. The default is a placeholder, not an address: `/admin/config` refuses it, a configuration file that turns the pool on with it stops startup, and the pool client will not connect with it. |
 | `C2A_CONFIG_FILE` | `c2a-config.json` | Where `/admin/config` saves the payout address and base difficulty. |
 | `C2A_ACTIVITY_LEDGER` | `c2a-activity.jsonl` | Activity ledger: the activity totals and recent events. |
 | `C2A_SHARE_LEDGER` | `c2a-share-ledger.jsonl` | Record of every pool share forwarded and its outcome. |

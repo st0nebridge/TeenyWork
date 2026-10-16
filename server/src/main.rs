@@ -61,7 +61,12 @@ pub struct PoolRuntimeConfig {
 
 impl PoolRuntimeConfig {
     fn validate(&self) -> Result<(), String> {
-        if !valid_payout_address(&self.payout_address) {
+        if self.payout_address == stratum_client::UNSET_PAYOUT_ADDRESS {
+            // The placeholder stands in only while the pool is off.
+            if self.pool_enabled {
+                return Err(stratum_client::UNSET_PAYOUT_ADDRESS_ERROR.into());
+            }
+        } else if !valid_payout_address(&self.payout_address) {
             return Err("Payout address must be a 26-90 character Bitcoin mainnet address".into());
         }
         if !(8..=24).contains(&self.required_work_units) {
@@ -489,7 +494,7 @@ async fn main() -> std::io::Result<()> {
     let pool_tls = pool_tls_setting(env_text("C2A_POOL_TLS")?.as_deref())
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
     let default_pool_username = std::env::var("C2A_POOL_USERNAME")
-        .unwrap_or_else(|_| stratum_client::DEFAULT_POOL_USERNAME.to_string());
+        .unwrap_or_else(|_| stratum_client::UNSET_PAYOUT_ADDRESS.to_string());
     let api_key = secrets.api_key.map(Arc::new);
     let browser_dir = Arc::new(PathBuf::from("browser"));
     let pool_config_path = PathBuf::from(
@@ -1505,6 +1510,7 @@ async fn metrics_endpoint(app: web::Data<AppState>) -> HttpResponse {
 #[cfg(test)]
 mod pool_runtime_config_tests {
     use super::*;
+    use crate::test_support::{test_state, ScratchDir, TEST_PAYOUT_ADDRESS};
     use actix_web::test as actix_test;
 
     #[actix_web::test]
@@ -1539,7 +1545,7 @@ mod pool_runtime_config_tests {
     #[test]
     fn validates_mainnet_payout_address_shape_and_difficulty_range() {
         let valid = PoolRuntimeConfig {
-            payout_address: stratum_client::DEFAULT_POOL_USERNAME.to_string(),
+            payout_address: TEST_PAYOUT_ADDRESS.to_string(),
             required_work_units: 12,
             pool_enabled: false,
         };
@@ -1559,6 +1565,84 @@ mod pool_runtime_config_tests {
         }
         .validate()
         .is_err());
+    }
+
+    #[test]
+    fn the_unset_placeholder_stands_in_only_while_the_pool_is_off() {
+        assert!(!valid_payout_address(stratum_client::UNSET_PAYOUT_ADDRESS));
+        let off = PoolRuntimeConfig {
+            payout_address: stratum_client::UNSET_PAYOUT_ADDRESS.to_string(),
+            required_work_units: 12,
+            pool_enabled: false,
+        };
+        assert!(off.validate().is_ok());
+        let on = PoolRuntimeConfig {
+            pool_enabled: true,
+            ..off
+        };
+        assert_eq!(
+            on.validate().unwrap_err(),
+            stratum_client::UNSET_PAYOUT_ADDRESS_ERROR
+        );
+    }
+
+    #[test]
+    fn a_fresh_start_holds_the_placeholder_with_the_pool_off() {
+        let dir = ScratchDir::new("fresh-start-config");
+        let loaded = load_pool_runtime_config(
+            &dir.join("config.json"),
+            stratum_client::UNSET_PAYOUT_ADDRESS.to_string(),
+        )
+        .unwrap();
+        assert_eq!(loaded.payout_address, stratum_client::UNSET_PAYOUT_ADDRESS);
+        assert!(!loaded.pool_enabled);
+    }
+
+    #[test]
+    fn a_saved_config_that_turns_the_pool_on_with_the_placeholder_stops_startup() {
+        let dir = ScratchDir::new("placeholder-config");
+        let path = dir.join("config.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "payout_address": stratum_client::UNSET_PAYOUT_ADDRESS,
+                "required_work_units": 12,
+                "pool_enabled": true,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let error = load_pool_runtime_config(&path, TEST_PAYOUT_ADDRESS.to_string())
+            .err()
+            .expect("a pool turned on with the placeholder must not load");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error
+            .to_string()
+            .contains(stratum_client::UNSET_PAYOUT_ADDRESS_ERROR));
+    }
+
+    #[actix_web::test]
+    async fn saving_the_placeholder_through_admin_config_is_refused() {
+        let dir = ScratchDir::new("admin-placeholder");
+        let state = test_state(&dir, Some("test-api-key"));
+        let request = actix_test::TestRequest::post()
+            .insert_header(("Authorization", "Bearer test-api-key"))
+            .to_http_request();
+        let response = admin_config_endpoint(
+            request,
+            state.clone(),
+            web::Json(AdminConfigRequest {
+                payout_address: stratum_client::UNSET_PAYOUT_ADDRESS.to_string(),
+                required_work_units: 16,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), actix_web::http::StatusCode::BAD_REQUEST);
+        let config = state.pool_runtime_config.read().await;
+        assert!(!config.pool_enabled);
+        assert_eq!(config.required_work_units, 12);
+        assert!(!dir.join("config.json").exists());
     }
 
     #[test]
@@ -1590,7 +1674,7 @@ mod pool_runtime_config_tests {
             Utc::now().timestamp_nanos_opt().unwrap_or_default()
         ));
         let config = PoolRuntimeConfig {
-            payout_address: stratum_client::DEFAULT_POOL_USERNAME.to_string(),
+            payout_address: TEST_PAYOUT_ADDRESS.to_string(),
             required_work_units: 17,
             pool_enabled: false,
         };
@@ -1622,7 +1706,7 @@ mod pool_runtime_config_tests {
         let share_ledger =
             ledger::LedgerFile::open(&ledger_path, ledger::DEFAULT_MAX_BYTES).unwrap();
         let initial_config = PoolRuntimeConfig {
-            payout_address: stratum_client::DEFAULT_POOL_USERNAME.to_string(),
+            payout_address: stratum_client::UNSET_PAYOUT_ADDRESS.to_string(),
             required_work_units: 12,
             pool_enabled: false,
         };
@@ -1820,6 +1904,10 @@ mod test_support {
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
+    /// A well-formed mainnet address for tests that need one; no test connects
+    /// to a pool with it.
+    pub const TEST_PAYOUT_ADDRESS: &str = "1BoatSLRHtKNngkdXEeobR76b53LETtpyT";
+
     /// A unique directory under the system temp dir, removed when dropped.
     pub struct ScratchDir(PathBuf);
 
@@ -1886,7 +1974,7 @@ mod test_support {
             submitted_shares: Arc::new(Mutex::new(submitted_shares)),
             share_ledger: Arc::new(StdMutex::new(share_ledger)),
             pool_runtime_config: Arc::new(RwLock::new(PoolRuntimeConfig {
-                payout_address: stratum_client::DEFAULT_POOL_USERNAME.to_string(),
+                payout_address: stratum_client::UNSET_PAYOUT_ADDRESS.to_string(),
                 required_work_units: 12,
                 pool_enabled: false,
             })),

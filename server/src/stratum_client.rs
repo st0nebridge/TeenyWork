@@ -15,9 +15,13 @@ use tokio_rustls::TlsConnector;
 trait AsyncIo: AsyncRead + AsyncWrite {}
 impl<T: AsyncRead + AsyncWrite> AsyncIo for T {}
 
-/// The payout address used before one is saved: BIP 173's example address.
-/// The pool connection stays off until `/admin/config` saves a real one.
-pub const DEFAULT_POOL_USERNAME: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+/// Stands in for the payout address until `/admin/config` saves one. It is not
+/// a Bitcoin address: saving it, or a saved setting that turns the pool on with
+/// it, is refused, and the pool client will not connect with it.
+pub const UNSET_PAYOUT_ADDRESS: &str = "UNSET-PAYOUT-ADDRESS";
+/// The error for any attempt to mine with `UNSET_PAYOUT_ADDRESS`.
+pub const UNSET_PAYOUT_ADDRESS_ERROR: &str =
+    "No payout address is set: save one through /admin/config";
 pub const WORKER_NAME: &str = "C2A-Pool";
 /// Most access-proof header hashes remembered at once, across the blocks live
 /// jobs build on: 50,000 proofs of 16 solutions, about 35 MB at most. A proof
@@ -255,6 +259,9 @@ pub async fn start_pool_connection_with(
     let username = username_updates.borrow().clone().ok_or_else(|| {
         "Pool connection is disabled until a payout address is configured".to_string()
     })?;
+    if username == UNSET_PAYOUT_ADDRESS {
+        return Err(UNSET_PAYOUT_ADDRESS_ERROR.to_string());
+    }
     println!("Connecting to Stratum pool {pool_host}");
     // Connecting, TLS, subscribe and authorize must all finish by this deadline.
     let handshake_deadline = tokio::time::Instant::now() + limits.handshake_timeout;
@@ -984,6 +991,35 @@ mod tests {
         pool_task.abort();
         drop(username_sender);
         (result, state)
+    }
+
+    #[tokio::test]
+    async fn the_unset_payout_address_never_reaches_the_pool() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let state = Arc::new(Mutex::new(PoolClient::new()));
+        let (_username_sender, mut username_updates) =
+            watch::channel(Some(UNSET_PAYOUT_ADDRESS.to_string()));
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            start_pool_connection_with(
+                state.clone(),
+                &address.to_string(),
+                &mut username_updates,
+                false,
+                PoolConnectionLimits::default(),
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| Err("TEST TIMEOUT: the client waited on the pool".to_string()));
+        assert_eq!(result.unwrap_err(), UNSET_PAYOUT_ADDRESS_ERROR);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                .await
+                .is_err(),
+            "the client connected to the pool"
+        );
+        assert!(!state.lock().await.connected);
     }
 
     #[tokio::test]

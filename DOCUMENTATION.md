@@ -192,7 +192,7 @@ Both ledgers are append-only JSON Lines files written through `server/src/ledger
 | `C2A_API_KEY` | unset | Optional. If set, it must not be blank or the `.env.example` placeholder, or the server will not start. Shorter than 32 characters only warns. An empty configured key never authenticates. |
 | `C2A_POOL_HOST` | `public-pool.io:14333` | |
 | `C2A_POOL_TLS` | `true` | `true` or `false`, in any case; any other value stops startup, so a typo cannot fall back to plaintext. |
-| `C2A_POOL_USERNAME` | built-in address | Initial payout address when `C2A_CONFIG_FILE` does not exist. |
+| `C2A_POOL_USERNAME` | `UNSET-PAYOUT-ADDRESS` | Initial payout address when `C2A_CONFIG_FILE` does not exist. The default is a placeholder that is refused wherever it would be mined to: by `/admin/config`, by a configuration file with `pool_enabled`, and by the pool client. |
 | `C2A_CONFIG_FILE` | `c2a-config.json` | `{"payout_address", "required_work_units", "pool_enabled"}`. An invalid file stops startup. |
 | `C2A_ACTIVITY_LEDGER` | `c2a-activity.jsonl` | |
 | `C2A_SHARE_LEDGER` | `c2a-share-ledger.jsonl` | |
