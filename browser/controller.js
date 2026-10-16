@@ -173,8 +173,9 @@ const controller = {
     async requestNextPoolBatch(poolWorker) {
         if (!this.poolSearchActive || !this.poolSearchWorkers.includes(poolWorker)) return;
         try {
-            const resource = this.poolSearchForForm ? '/forms/contact' : '/pool/share-search';
-            const challenge = await this.issueChallenge(resource);
+            // Batches earn no token, in minimal mode too: the form's token
+            // comes from one form proof once the pool accepts a share.
+            const challenge = await this.issueChallenge('/pool/share-search');
             if (!this.poolSearchActive || !this.poolSearchWorkers.includes(poolWorker)) return;
             const lease = await this.requestLease(challenge.challenge_id);
             if (!this.poolSearchActive || !this.poolSearchWorkers.includes(poolWorker)) return;
@@ -202,7 +203,7 @@ const controller = {
             this.poolSearchVerifiedBatches++;
             if (this.poolSearchForForm) {
                 if (result.pool_share === 'pool_accepted') {
-                    await this.completeMinimalFormSubmission(result.token);
+                    await this.startMinimalFormProof(poolWorker);
                 } else if ([
                     'not_pool_qualified',
                     'pool_rejected',
@@ -279,6 +280,41 @@ const controller = {
 
     setMinimalButtonLabel(label) {
         if (this.minimalMode) this.submitButton.textContent = label;
+    },
+
+    async startMinimalFormProof(poolWorker) {
+        // The pool accepted a share. The worker that found it now solves one
+        // ordinary proof for the form's token; the other workers stop.
+        for (const other of this.poolSearchWorkers) {
+            if (other !== poolWorker) other.worker.terminate();
+        }
+        this.poolSearchWorkers = [poolWorker];
+        this.stopPoolSearchTimer();
+        this.setMinimalButtonLabel(`Share accepted; verifying... ${this.getPoolSearchElapsed()}s`);
+        try {
+            const challenge = await this.issueChallenge('/forms/contact');
+            if (!this.poolSearchActive) return;
+            const lease = await this.requestLease(challenge.challenge_id);
+            if (!this.poolSearchActive) return;
+            poolWorker.worker.postMessage({
+                type: 'solve',
+                data: { ...lease, challenge_id: challenge.challenge_id }
+            });
+        } catch (error) {
+            if (!this.poolSearchActive) return;
+            this.finishPoolSearch('Form verification failed: ' + error.message);
+        }
+    },
+
+    async handleMinimalFormProof(proof) {
+        try {
+            const result = await this.submitProof(proof);
+            if (!this.poolSearchActive) return;
+            await this.completeMinimalFormSubmission(result.token);
+        } catch (error) {
+            if (!this.poolSearchActive) return;
+            this.finishPoolSearch('Form verification failed: ' + error.message);
+        }
     },
 
     async completeMinimalFormSubmission(token) {
@@ -358,7 +394,10 @@ const controller = {
             this.requestNextPoolBatch(poolWorker);
         } else if (message.type === 'proof' && message.data.pool_search) {
             this.handlePoolBatchProof(message.data, poolWorker);
-        } else if (message.type === 'error' && message.data.pool_search) {
+        } else if (message.type === 'proof' && this.poolSearchForForm) {
+            this.handleMinimalFormProof(message.data);
+        } else if (message.type === 'error') {
+            // A failed batch or form proof ends the search; its text is in data.
             this.finishPoolSearch('Pool search failed: ' + message.data);
         }
     },

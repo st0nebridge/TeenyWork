@@ -50,6 +50,10 @@ impl<V: Expiring> ExpiringTable<V> {
         self.entries.get(key)
     }
 
+    pub fn get_mut(&mut self, key: &str) -> Option<&mut V> {
+        self.entries.get_mut(key)
+    }
+
     pub fn remove(&mut self, key: &str) -> Option<V> {
         self.entries.remove(key)
     }

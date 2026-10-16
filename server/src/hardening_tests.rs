@@ -1,12 +1,16 @@
 //! @module hardening_tests
 //! @description Regression tests for the server's limits: bounded challenge,
-//! lease and token tables; leases that only their own proof can spend;
-//! extranonce2 values kept when a lease is refused; the JSON body cap; strict
+//! lease and token tables and remembered solutions; leases that only their
+//! own proof can spend, at most eight per challenge; extranonce2 values kept
+//! when a lease is refused; a token slot held from before a proof's work is
+//! spent; pool-search proofs that earn no token; the JSON body cap; strict
 //! `C2A_POOL_TLS`. Also a guard that the listener stays HTTP/1.1-only, which
 //! keeps actix's HTTP/2 stack, and the `h2` advisories, out of reach.
 
 use super::*;
-use crate::access_proof_replay_tests::{candidates, json_body, prove, replay_state, solve};
+use crate::access_proof_replay_tests::{
+    candidates, json_body, prove, replay_state, serve_job, solve,
+};
 use crate::test_support::ScratchDir;
 use actix_web::http::StatusCode;
 use actix_web::test as actix_test;
@@ -488,4 +492,209 @@ async fn a_lease_is_live_until_its_expiry_and_not_at_it() {
         !leases.contains_key(&challenge_id),
         "an expired lease is dropped"
     );
+}
+
+#[actix_web::test]
+async fn a_proof_without_1_to_32_candidates_does_not_spend_its_lease() {
+    let dir = ScratchDir::new("hardening-candidate-count");
+    let state = replay_state(&dir).await;
+    let challenge_id = new_challenge_id(&state).await;
+    let (_, lease) = lease_for(&state, &challenge_id, "worker").await;
+    let solutions = solve(&lease, 0);
+    let too_many: Vec<_> = solutions.iter().cycle().take(33).copied().collect();
+    for refused in [Vec::new(), too_many] {
+        let count = refused.len();
+        let (status, body) = prove(&state, &lease, &refused).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{count} candidates: {body}"
+        );
+        assert_eq!(
+            body,
+            serde_json::json!("Provide between 1 and 32 verified candidates")
+        );
+        assert!(
+            state.leases.lock().await.contains_key(&challenge_id),
+            "{count} candidates leave the lease in place"
+        );
+    }
+    // 32 candidates are allowed: the 16 solutions, each sent twice.
+    let most: Vec<_> = solutions.iter().cycle().take(32).copied().collect();
+    let (status, granted) = prove(&state, &lease, &most).await;
+    assert_eq!(status, StatusCode::OK, "{granted}");
+}
+
+#[actix_web::test]
+async fn a_challenge_gets_at_most_eight_leases() {
+    let dir = ScratchDir::new("hardening-leases-per-challenge");
+    let state = replay_state(&dir).await;
+    let challenge_id = new_challenge_id(&state).await;
+    for issued in 0..8 {
+        let (status, lease) = lease_for(&state, &challenge_id, "worker").await;
+        assert_eq!(status, StatusCode::OK, "lease {issued}: {lease}");
+        // A candidate whose hash does not match its header uses the lease up.
+        let (status, body) = prove(&state, &lease, &[(0, [0u8; 32])]).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+    let (status, body) = lease_for(&state, &challenge_id, "worker").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body,
+        serde_json::json!("This challenge has had its 8 work leases; request a new challenge")
+    );
+    assert_eq!(
+        state.stratum_pool.lock().await.next_extranonce_2,
+        Some(8),
+        "the refused lease took no extranonce2"
+    );
+    let other = new_challenge_id(&state).await;
+    let (status, lease) = lease_for(&state, &other, "worker").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "other challenges still lease: {lease}"
+    );
+}
+
+#[actix_web::test]
+async fn a_full_spent_set_answers_503_and_keeps_the_challenge() {
+    let dir = ScratchDir::new("hardening-spent-set");
+    let state = replay_state(&dir).await;
+    // Room for one proof's sixteen solutions.
+    state.stratum_pool.lock().await.spent_access_proof_capacity = 16;
+    let first = new_challenge_id(&state).await;
+    let (_, lease) = lease_for(&state, &first, "worker").await;
+    assert_eq!(
+        prove(&state, &lease, &solve(&lease, 0)).await.0,
+        StatusCode::OK
+    );
+
+    let second = new_challenge_id(&state).await;
+    let (_, lease) = lease_for(&state, &second, "worker").await;
+    let (status, body) = prove(&state, &lease, &solve(&lease, 0)).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body, serde_json::json!(AT_CAPACITY));
+    assert!(
+        state.challenges.lock().await.contains_key(&second),
+        "the challenge is kept for a retry"
+    );
+    assert_eq!(
+        state.access_tokens.lock().await.len(),
+        1,
+        "the refused proof holds no token slot"
+    );
+
+    state.stratum_pool.lock().await.spent_access_proof_capacity = 32;
+    let (_, retry) = lease_for(&state, &second, "worker").await;
+    let (status, retried) = prove(&state, &retry, &solve(&retry, 0)).await;
+    assert_eq!(status, StatusCode::OK, "{retried}");
+}
+
+#[actix_web::test]
+async fn a_proof_holds_its_token_slot_from_before_its_work_is_spent() {
+    let dir = ScratchDir::new("hardening-token-slot");
+    let (state, gate) = crate::test_support::gated_test_state(&dir);
+    state.pool_runtime_config.write().await.required_work_units = 8;
+    serve_job(&state, 1, true).await;
+    *state.access_tokens.lock().await = ExpiringTable::new(1);
+    // One ledger group each for the challenge and the lease.
+    gate.release_one();
+    let challenge_id = new_challenge_id(&state).await;
+    gate.release_one();
+    let (_, lease) = lease_for(&state, &challenge_id, "worker").await;
+    let solutions = solve(&lease, 0);
+
+    let proof = prove(&state, &lease, &solutions);
+    tokio::pin!(proof);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut proof)
+            .await
+            .is_err(),
+        "the proof waits for the held ledger writer"
+    );
+    // Another grant arrives while the accepted proof is being recorded.
+    let filler = state.access_tokens.lock().await.insert(
+        "another-token".to_string(),
+        AccessGrant {
+            resource: "/forms/contact".to_string(),
+            expires_at: Utc::now() + chrono::TimeDelta::hours(1),
+            challenge_id: "another-challenge".to_string(),
+            work_units: 8,
+        },
+        Utc::now(),
+    );
+    assert!(filler.is_err(), "the proof already holds the last slot");
+
+    drop(gate);
+    let (status, body) = proof.await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["token"].is_string(), "{body}");
+}
+
+#[actix_web::test]
+async fn a_pool_search_proof_is_checked_and_recorded_but_earns_no_token() {
+    let dir = ScratchDir::new("hardening-pool-search");
+    let state = replay_state(&dir).await;
+    let accepted = || state.analytics.proofs_accepted.load(Ordering::Relaxed);
+    for resource in ["/pool/share-search", "/pool/share-search?batch=2"] {
+        let (status, challenge) = challenge_status(&state, resource, false, None).await;
+        assert_eq!(status, StatusCode::OK, "{challenge}");
+        let challenge_id = challenge["challenge_id"].as_str().unwrap().to_string();
+        let (_, lease) = lease_for(&state, &challenge_id, "worker").await;
+        let accepted_before = accepted();
+
+        let (status, body) = prove(&state, &lease, &solve(&lease, 0)).await;
+        assert_eq!(status, StatusCode::OK, "{resource}: {body}");
+        assert!(body["token"].is_null(), "{resource}: {body}");
+        assert!(body["expiry"].is_null(), "{resource}: {body}");
+        assert_eq!(body["credits_remaining"], 0, "{resource}: {body}");
+        assert_eq!(body["pool_share"], "not_pool_qualified");
+        assert_eq!(accepted(), accepted_before + 1, "the proof is recorded");
+        assert!(
+            !state.challenges.lock().await.contains_key(&challenge_id),
+            "the challenge is used up"
+        );
+        assert_eq!(
+            state.access_tokens.lock().await.len(),
+            0,
+            "no grant holds a slot"
+        );
+    }
+
+    let (_, form_lease) = lease_for(&state, &new_challenge_id(&state).await, "worker").await;
+    let (status, form) = prove(&state, &form_lease, &solve(&form_lease, 0)).await;
+    assert_eq!(status, StatusCode::OK, "{form}");
+    assert!(
+        form["token"].is_string(),
+        "a form proof still earns a token: {form}"
+    );
+}
+
+#[actix_web::test]
+async fn a_header_hash_that_is_not_32_bytes_is_refused_as_such() {
+    let dir = ScratchDir::new("hardening-hash-length");
+    let state = replay_state(&dir).await;
+    for length in [31, 33] {
+        let challenge_id = new_challenge_id(&state).await;
+        let (_, lease) = lease_for(&state, &challenge_id, "worker").await;
+        let mut sent = candidates(&lease, &solve(&lease, 0));
+        sent[0].header_hash = "ab".repeat(length);
+        let response = proof_endpoint(
+            state.clone(),
+            web::Json(ProofRequest {
+                challenge_id,
+                lease_id: lease["lease_id"].as_str().unwrap().to_string(),
+                worker_id: "worker".to_string(),
+                candidates: sent,
+                hashes_attempted: 0,
+                elapsed_ms: 0,
+            }),
+        )
+        .await
+        .unwrap();
+        let (status, body) = json_body(response).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{length} bytes: {body}");
+        assert_eq!(body, serde_json::json!("header_hash must be 32-byte hex"));
+    }
 }

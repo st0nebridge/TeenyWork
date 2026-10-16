@@ -19,6 +19,38 @@ impl<T: AsyncRead + AsyncWrite> AsyncIo for T {}
 /// The pool connection stays off until `/admin/config` saves a real one.
 pub const DEFAULT_POOL_USERNAME: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
 pub const WORKER_NAME: &str = "C2A-Pool";
+/// Most access-proof header hashes remembered at once, across the blocks live
+/// jobs build on: 50,000 proofs of 16 solutions, about 35 MB at most. A proof
+/// that would pass it is refused until a new block lets the old ones go.
+pub const MAX_SPENT_ACCESS_PROOFS: usize = 800_000;
+/// Extranonce2 widths under this many bytes are logged as a warning.
+const NARROW_EXTRANONCE2_BYTES: usize = 4;
+
+/// What `spend_access_proofs` did with a proof's qualifying hashes.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AccessProofSpend {
+    /// Enough were new; the number the proof needs are now remembered.
+    Spent,
+    /// Fewer than the proof needs are new: the rest have earned a token.
+    AlreadyRewarded,
+    /// Remembering them would pass the capacity; nothing was recorded.
+    Full,
+}
+
+/// A warning for a pool whose extranonce2 width gives few work leases per
+/// job: every lease takes the next value, and leases stop until the pool's
+/// next job once they run out.
+pub fn narrow_extranonce2_warning(size: usize) -> Option<String> {
+    if size >= NARROW_EXTRANONCE2_BYTES {
+        return None;
+    }
+    let leases = 1u64 << (8 * size);
+    Some(format!(
+        "The pool's extranonce2 is {size} byte(s), so each pool job has {leases} work leases; \
+         a client that leases repeatedly can use them up until the next job, so rate-limit \
+         the challenges the site mints"
+    ))
+}
 
 #[derive(Clone)]
 pub struct PoolJob {
@@ -51,10 +83,12 @@ pub struct PoolClient {
     pub next_extranonce_2: Option<u128>,
     pub submit_sender: Option<mpsc::Sender<ShareSubmission>>,
     next_generation: u64,
-    /// Header hashes that have already earned an access token, by the
-    /// previous-block hash they build on. Kept across reconnects and
-    /// extranonce resets; dropped once no live job builds on that block.
+    /// Header hashes that accepted access proofs used, by the previous-block
+    /// hash they build on. Kept across reconnects and extranonce resets;
+    /// dropped once no live job builds on that block.
     spent_access_proofs: HashMap<String, HashSet<[u8; 32]>>,
+    /// Most header hashes `spent_access_proofs` holds, over all its blocks.
+    pub spent_access_proof_capacity: usize,
 }
 
 impl PoolClient {
@@ -71,6 +105,7 @@ impl PoolClient {
             submit_sender: None,
             next_generation: 0,
             spent_access_proofs: HashMap::new(),
+            spent_access_proof_capacity: MAX_SPENT_ACCESS_PROOFS,
         }
     }
 
@@ -109,9 +144,11 @@ impl PoolClient {
         Ok(true)
     }
 
-    /// Records access-proof header hashes built on `prev_block_hash` when at
-    /// least `required` different ones (and always at least one) have not yet
-    /// earned an access token; otherwise records nothing and returns false.
+    /// Remembers `required` (and always at least one) different access-proof
+    /// header hashes built on `prev_block_hash` that have not been used
+    /// before, the first such in `hashes`. The proof's other hashes earned
+    /// nothing and are not remembered. Records nothing when fewer are new, or
+    /// when the set would then hold more than its capacity.
     /// A header hash commits to the job, both extranonces, nTime and nonce, so
     /// a repeat is the same work presented again, however the lease was issued.
     pub fn spend_access_proofs(
@@ -119,20 +156,30 @@ impl PoolClient {
         prev_block_hash: &str,
         hashes: &[[u8; 32]],
         required: usize,
-    ) -> bool {
+    ) -> AccessProofSpend {
+        let needed = required.max(1);
+        let held: usize = self.spent_access_proofs.values().map(HashSet::len).sum();
         let spent = self
             .spent_access_proofs
             .entry(prev_block_hash.to_string())
             .or_default();
-        let fresh: HashSet<&[u8; 32]> = hashes
-            .iter()
-            .filter(|hash| !spent.contains(*hash))
-            .collect();
-        if fresh.len() < required.max(1) {
-            return false;
+        let mut fresh: Vec<[u8; 32]> = Vec::new();
+        for hash in hashes {
+            if fresh.len() == needed {
+                break;
+            }
+            if !spent.contains(hash) && !fresh.contains(hash) {
+                fresh.push(*hash);
+            }
         }
-        spent.extend(hashes.iter().copied());
-        true
+        if fresh.len() < needed {
+            return AccessProofSpend::AlreadyRewarded;
+        }
+        if held + needed > self.spent_access_proof_capacity {
+            return AccessProofSpend::Full;
+        }
+        spent.extend(fresh);
+        AccessProofSpend::Spent
     }
 
     pub fn allocate_job(&mut self) -> Result<(PoolJob, String), String> {
@@ -316,6 +363,9 @@ pub async fn start_pool_connection_with(
                                 state.extranonce_2_size = extranonce_2_size;
                                 state.next_extranonce_2 = Some(0);
                             }
+                            if let Some(warning) = narrow_extranonce2_warning(extranonce_2_size) {
+                                eprintln!("{warning}");
+                            }
                             send_message(&mut writer, &client.authorize_request(&worker_name)).await?;
                             println!("Subscribed; authorizing worker {worker_name}");
                         }
@@ -363,6 +413,10 @@ pub async fn start_pool_connection_with(
                         state.next_extranonce_2 = Some(0);
                         state.jobs.clear();
                         state.current_job = None;
+                        drop(state);
+                        if let Some(warning) = narrow_extranonce2_warning(extranonce_2_size) {
+                            eprintln!("{warning}");
+                        }
                     }
                     Some("mining.notify") => {
                         let job = client.parse_job_notification(&message)
@@ -733,6 +787,7 @@ mod tests {
 
     #[test]
     fn spent_access_proofs_survive_resets_until_the_chain_moves_on() {
+        use AccessProofSpend::{AlreadyRewarded, Spent};
         let block_a = "0a".repeat(32);
         let block_b = "0b".repeat(32);
         let mut state = authorized_pool(4);
@@ -740,25 +795,30 @@ mod tests {
             .install_job(notify("job-a", &block_a, true), "address.worker")
             .unwrap();
         let hash = [7u8; 32];
-        assert!(state.spend_access_proofs(&block_a, &[hash], 1));
-        assert!(
-            !state.spend_access_proofs(&block_a, &[hash], 1),
+        assert_eq!(state.spend_access_proofs(&block_a, &[hash], 1), Spent);
+        assert_eq!(
+            state.spend_access_proofs(&block_a, &[hash], 1),
+            AlreadyRewarded,
             "a spent proof is refused"
         );
-        assert!(
+        assert_eq!(
             state.spend_access_proofs(&block_a, &[hash, [8u8; 32]], 1),
+            Spent,
             "a proof with enough unspent qualifying hashes is new work"
         );
-        assert!(
-            !state.spend_access_proofs(&block_a, &[hash, [8u8; 32], [9u8; 32]], 2),
+        assert_eq!(
+            state.spend_access_proofs(&block_a, &[hash, [8u8; 32], [9u8; 32]], 2),
+            AlreadyRewarded,
             "spent hashes do not make up the number a proof needs"
         );
-        assert!(
+        assert_eq!(
             state.spend_access_proofs(&block_a, &[[9u8; 32], [10u8; 32]], 2),
+            Spent,
             "a refused proof spends nothing"
         );
-        assert!(
-            !state.spend_access_proofs(&block_a, &[[11u8; 32], [11u8; 32]], 2),
+        assert_eq!(
+            state.spend_access_proofs(&block_a, &[[11u8; 32], [11u8; 32]], 2),
+            AlreadyRewarded,
             "a hash given twice counts once"
         );
 
@@ -768,26 +828,122 @@ mod tests {
         state
             .install_job(notify("job-a2", &block_a, true), "address.worker")
             .unwrap();
-        assert!(
-            !state.spend_access_proofs(&block_a, &[hash], 1),
+        assert_eq!(
+            state.spend_access_proofs(&block_a, &[hash], 1),
+            AlreadyRewarded,
             "a reset with the same previous block keeps the spent set"
         );
 
         state
             .install_job(notify("job-b", &block_b, true), "address.worker")
             .unwrap();
-        assert!(
+        assert_eq!(
             state.spend_access_proofs(&block_a, &[hash], 1),
+            Spent,
             "work on a replaced previous block is forgotten"
         );
-        assert!(
-            !state.spend_access_proofs(&block_b, &[], 1),
+        assert_eq!(
+            state.spend_access_proofs(&block_b, &[], 1),
+            AlreadyRewarded,
             "no qualifying hash, no token"
         );
-        assert!(
-            !state.spend_access_proofs(&block_b, &[], 0),
+        assert_eq!(
+            state.spend_access_proofs(&block_b, &[], 0),
+            AlreadyRewarded,
             "a proof always needs at least one hash"
         );
+    }
+
+    #[test]
+    fn a_proof_remembers_only_the_solutions_it_needs() {
+        use AccessProofSpend::{AlreadyRewarded, Spent};
+        let block = "0a".repeat(32);
+        let mut state = authorized_pool(4);
+        state
+            .install_job(notify("job-a", &block, true), "address.worker")
+            .unwrap();
+        let hashes: Vec<[u8; 32]> = (0..32u8).map(|byte| [byte; 32]).collect();
+        assert_eq!(state.spend_access_proofs(&block, &hashes, 16), Spent);
+        assert_eq!(state.spent_access_proofs[&block].len(), 16);
+        assert_eq!(
+            state.spend_access_proofs(&block, &hashes[..16], 16),
+            AlreadyRewarded,
+            "the first sixteen earned the token"
+        );
+        assert_eq!(
+            state.spend_access_proofs(&block, &hashes[16..], 16),
+            Spent,
+            "the other sixteen never earned one"
+        );
+    }
+
+    #[test]
+    fn the_spent_set_is_capped_and_a_refused_proof_records_nothing() {
+        use AccessProofSpend::{AlreadyRewarded, Full, Spent};
+        assert_eq!(
+            PoolClient::new().spent_access_proof_capacity,
+            MAX_SPENT_ACCESS_PROOFS
+        );
+        let block_a = "0a".repeat(32);
+        let block_b = "0b".repeat(32);
+        let block_c = "0c".repeat(32);
+        let mut state = authorized_pool(4);
+        state
+            .install_job(notify("job-a", &block_a, true), "address.worker")
+            .unwrap();
+        state.spent_access_proof_capacity = 3;
+        assert_eq!(
+            state.spend_access_proofs(&block_a, &[[1; 32], [2; 32]], 2),
+            Spent
+        );
+        assert_eq!(
+            state.spend_access_proofs(&block_a, &[[3; 32], [4; 32]], 2),
+            Full,
+            "two more would make four"
+        );
+        assert_eq!(
+            state.spend_access_proofs(&block_a, &[[3; 32]], 1),
+            Spent,
+            "the refused proof recorded nothing, and a third fits"
+        );
+        assert_eq!(state.spend_access_proofs(&block_a, &[[4; 32]], 1), Full);
+        assert_eq!(
+            state.spend_access_proofs(&block_a, &[[1; 32]], 1),
+            AlreadyRewarded,
+            "a replay is refused as one even when the set is full"
+        );
+
+        state
+            .install_job(notify("job-b", &block_b, false), "address.worker")
+            .unwrap();
+        assert_eq!(
+            state.spend_access_proofs(&block_b, &[[4; 32]], 1),
+            Full,
+            "solutions on a block a live job still builds on count"
+        );
+        state
+            .install_job(notify("job-c", &block_c, true), "address.worker")
+            .unwrap();
+        assert_eq!(
+            state.spend_access_proofs(&block_c, &[[4; 32], [5; 32], [6; 32]], 3),
+            Spent,
+            "a new block lets the old blocks' solutions go"
+        );
+    }
+
+    #[test]
+    fn an_extranonce2_under_four_bytes_is_warned_about() {
+        for (size, leases) in [(1, "256"), (2, "65536"), (3, "16777216")] {
+            let warning = narrow_extranonce2_warning(size)
+                .unwrap_or_else(|| panic!("{size} bytes are warned about"));
+            assert!(
+                warning.contains(&format!("{leases} work leases")),
+                "{warning}"
+            );
+        }
+        for size in 4..=16 {
+            assert_eq!(narrow_extranonce2_warning(size), None, "{size} bytes");
+        }
     }
 
     async fn run_against_pool<F, Fut>(

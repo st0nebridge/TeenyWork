@@ -8,7 +8,7 @@ use compute_to_access_core::proof::bitcoin::sha256d;
 use compute_to_access_core::stratum::{
     block_header_for_share, meets_access_bits, meets_difficulty_target, target_hex,
 };
-use compute_to_access_core::token::access_token::issue_access_token;
+use compute_to_access_core::token::access_token::{issue_access_token, AccessToken};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::io::{self, Write};
@@ -38,11 +38,18 @@ const ACCESS_TOKEN_USES: u64 = 1;
 const MAX_LIVE_CHALLENGES: usize = 50_000;
 /// Most live work leases held at once; each lives 90 seconds.
 const MAX_LIVE_LEASES: usize = 20_000;
+/// Most work leases one challenge is given. Each takes an extranonce2, so the
+/// cap ties a client's use of a job's range to the challenges the site mints.
+const MAX_LEASES_PER_CHALLENGE: usize = 8;
 /// Most unused access-token grants held at once; each lives an hour.
 const MAX_LIVE_ACCESS_TOKENS: usize = 50_000;
 /// Largest JSON request body accepted. A proof with 32 candidates is under 8 KiB.
 const MAX_JSON_BODY_BYTES: usize = 64 * 1024;
 const AT_CAPACITY: &str = "The Challenger is at capacity; try again shortly";
+/// The demo page's pool search proves work for this resource. Its proofs are
+/// checked, recorded and forwarded like any other, but earn no token, which
+/// nothing would redeem.
+const POOL_SEARCH_RESOURCE: &str = "/pool/share-search";
 
 #[derive(Clone, Deserialize, Serialize)]
 pub struct PoolRuntimeConfig {
@@ -111,6 +118,12 @@ fn access_difficulty_for_resource(resource: &str, configured: u64) -> Option<u64
         path if path.starts_with("/bulk") => Some(configured.max(18)),
         _ => Some(configured),
     }
+}
+
+/// Whether a proof for `resource` earns an access token: every resource but
+/// the demo's pool search, with or without a query string, does.
+fn earns_access_token(resource: &str) -> bool {
+    resource.split('?').next() != Some(POOL_SEARCH_RESOURCE)
 }
 
 fn load_pool_runtime_config(
@@ -214,10 +227,19 @@ pub struct ProtectedQuery {
 
 #[derive(Deserialize, Serialize)]
 pub struct TokenResponse {
-    pub token: String,
+    /// The access token and its expiry; `None` for a pool-search proof,
+    /// which earns no token.
+    pub token: Option<String>,
     pub credits_remaining: u64,
-    pub expiry: String,
+    pub expiry: Option<String>,
     pub pool_share: String,
+}
+
+/// A live challenge and the number of work leases it has been given.
+#[derive(Clone)]
+pub struct HeldChallenge {
+    pub challenge: Challenge,
+    pub leases_issued: usize,
 }
 
 #[derive(Clone)]
@@ -246,9 +268,9 @@ pub struct AccessGrant {
     pub work_units: u64,
 }
 
-impl Expiring for Challenge {
+impl Expiring for HeldChallenge {
     fn expires_at(&self) -> DateTime<Utc> {
-        self.expires_at
+        self.challenge.expires_at
     }
 }
 
@@ -285,7 +307,7 @@ async fn record_activity(
 pub struct AppState {
     pub server_secret: Arc<Vec<u8>>,
     pub stratum_pool: Arc<Mutex<stratum_client::PoolClient>>,
-    pub challenges: Arc<Mutex<ExpiringTable<Challenge>>>,
+    pub challenges: Arc<Mutex<ExpiringTable<HeldChallenge>>>,
     /// Live work leases by challenge ID: a challenge has at most one.
     pub leases: Arc<Mutex<ExpiringTable<WorkLease>>>,
     pub access_tokens: Arc<Mutex<ExpiringTable<AccessGrant>>>,
@@ -615,7 +637,14 @@ async fn challenge_endpoint(
         .challenges
         .lock()
         .await
-        .insert(challenge.challenge_id.clone(), challenge, Utc::now())
+        .insert(
+            challenge.challenge_id.clone(),
+            HeldChallenge {
+                challenge,
+                leases_issued: 0,
+            },
+            Utc::now(),
+        )
         .is_err()
     {
         return Ok(HttpResponse::ServiceUnavailable().body(AT_CAPACITY));
@@ -680,15 +709,22 @@ async fn lease_endpoint(
     if req.worker_id.is_empty() || req.worker_id.len() > 128 {
         return Ok(HttpResponse::BadRequest().body("Invalid worker id"));
     }
-    let challenge = match app.challenges.lock().await.get(&req.challenge_id).cloned() {
-        Some(challenge) => challenge,
+    let held = match app.challenges.lock().await.get(&req.challenge_id).cloned() {
+        Some(held) => held,
         None => return Ok(HttpResponse::BadRequest().body("Unknown or expired challenge")),
     };
+    let challenge = held.challenge;
     if let Err(error) = verify_challenge(&app.server_secret, &challenge) {
         return Ok(HttpResponse::BadRequest().body(error));
     }
     // Refuse before taking an extranonce2, so refused requests cannot use up
     // the job's extranonce2 space.
+    if held.leases_issued >= MAX_LEASES_PER_CHALLENGE {
+        return Ok(HttpResponse::BadRequest().body(format!(
+            "This challenge has had its {MAX_LEASES_PER_CHALLENGE} work leases; \
+             request a new challenge"
+        )));
+    }
     {
         let mut leases = app.leases.lock().await;
         let now = Utc::now();
@@ -733,6 +769,10 @@ async fn lease_endpoint(
         {
             return Ok(HttpResponse::ServiceUnavailable().body(AT_CAPACITY));
         }
+    }
+    // Counted once issued: the extranonce2 is the lease's from here on.
+    if let Some(held) = app.challenges.lock().await.get_mut(&challenge.challenge_id) {
+        held.leases_issued += 1;
     }
     if let Err(error) = record_activity(
         &app,
@@ -815,13 +855,18 @@ async fn proof_endpoint(
         .lock()
         .await
         .get(&proof.challenge_id)
-        .cloned()
+        .map(|held| held.challenge.clone())
     {
         Some(challenge) => challenge,
         None => return Ok(HttpResponse::BadRequest().body("Unknown or already-used challenge")),
     };
     if let Err(error) = verify_challenge(&app.server_secret, &challenge) {
         return Ok(HttpResponse::BadRequest().body(error));
+    }
+    // Checked before the lease is taken, so a malformed proof cannot use up
+    // a lease, and with it an extranonce2, without a record.
+    if proof.candidates.is_empty() || proof.candidates.len() > 32 {
+        return Ok(HttpResponse::BadRequest().body("Provide between 1 and 32 verified candidates"));
     }
     let lease = match take_proof_lease(&mut *app.leases.lock().await, &proof, Utc::now()) {
         Ok(lease) => lease,
@@ -839,9 +884,6 @@ async fn proof_endpoint(
         return Ok(
             HttpResponse::Conflict().body("Pool job was invalidated before proof submission")
         );
-    }
-    if proof.candidates.is_empty() || proof.candidates.len() > 32 {
-        return Ok(HttpResponse::BadRequest().body("Provide between 1 and 32 verified candidates"));
     }
     let mut verified_candidates = Vec::new();
     for candidate in proof.candidates {
@@ -917,46 +959,104 @@ async fn proof_endpoint(
         })?;
         return Ok(HttpResponse::BadRequest().body("Invalid proof of work"));
     }
-    // Refuse while there is no room for the token, before the work is spent.
-    if !app.access_tokens.lock().await.has_room(Utc::now()) {
-        return Ok(HttpResponse::ServiceUnavailable().body(AT_CAPACITY));
+    // The token's slot is taken before the work is spent and kept until the
+    // proof is settled, so a proof is never refused for room once its
+    // challenge and solutions are used. The demo's pool search earns no token.
+    let grant = if earns_access_token(&challenge.resource) {
+        let Some(token) = store_access_grant(
+            &app,
+            &proof.challenge_id,
+            &challenge.resource,
+            challenge.required_work_units,
+        )
+        .await?
+        else {
+            return Ok(HttpResponse::ServiceUnavailable().body(AT_CAPACITY));
+        };
+        Some(token)
+    } else {
+        None
+    };
+    let settled = settle_access_proof(
+        &app,
+        &proof.challenge_id,
+        &lease,
+        &access_hashes,
+        &verified_candidates,
+    )
+    .await;
+    if !matches!(settled, Ok(Ok(_))) {
+        if let Some(token) = &grant {
+            app.access_tokens.lock().await.remove(&token.token_id);
+        }
     }
+    let pool_share = match settled? {
+        Ok(pool_share) => pool_share,
+        Err(refusal) => return Ok(refusal),
+    };
+    Ok(HttpResponse::Ok().json(TokenResponse {
+        credits_remaining: if grant.is_some() {
+            ACCESS_TOKEN_USES
+        } else {
+            0
+        },
+        expiry: grant.as_ref().map(|token| token.expires_at.to_rfc3339()),
+        token: grant.map(|token| token.token_id),
+        pool_share,
+    }))
+}
+
+/// Spends a checked proof's solutions, uses up its challenge, records the
+/// accepted proof and forwards each candidate that meets the pool's share
+/// target. Returns the pool share status, or the refusal to send when the
+/// solutions have already earned a token, too many solutions are already
+/// remembered, or the challenge was used meanwhile.
+async fn settle_access_proof(
+    app: &AppState,
+    challenge_id: &str,
+    lease: &WorkLease,
+    access_hashes: &[[u8; 32]],
+    verified_candidates: &[(ProofCandidate, [u8; 32])],
+) -> Result<Result<String, HttpResponse>, Error> {
     // The same header presented again (after an extranonce2 reset, a reconnect
     // or a set_extranonce) is old work and earns no second token, so the
     // solutions the lease asks for must all be ones that have not earned one.
-    if !app.stratum_pool.lock().await.spend_access_proofs(
+    let spend = app.stratum_pool.lock().await.spend_access_proofs(
         &lease.pool_job.job.prev_block_hash,
-        &access_hashes,
+        access_hashes,
         lease.solutions,
-    ) {
-        record_activity(
-            &app,
-            ActivityKind::ProofRejected,
-            Some(&proof.challenge_id),
-            Some(lease.work_units),
-        )
-        .await
-        .map_err(|error| {
-            Error::from(io::Error::other(format!(
-                "Could not record rejected proof: {error}"
-            )))
-        })?;
-        return Ok(HttpResponse::BadRequest()
-            .body("This proof of work has already earned an access token"));
+    );
+    match spend {
+        stratum_client::AccessProofSpend::Spent => {}
+        stratum_client::AccessProofSpend::Full => {
+            return Ok(Err(HttpResponse::ServiceUnavailable().body(AT_CAPACITY)));
+        }
+        stratum_client::AccessProofSpend::AlreadyRewarded => {
+            record_activity(
+                app,
+                ActivityKind::ProofRejected,
+                Some(challenge_id),
+                Some(lease.work_units),
+            )
+            .await
+            .map_err(|error| {
+                Error::from(io::Error::other(format!(
+                    "Could not record rejected proof: {error}"
+                )))
+            })?;
+            return Ok(Err(HttpResponse::BadRequest()
+                .body("This proof of work has already earned an access token")));
+        }
     }
-    if app
-        .challenges
-        .lock()
-        .await
-        .remove(&proof.challenge_id)
-        .is_none()
-    {
-        return Ok(HttpResponse::BadRequest().body("Challenge has already been used"));
+    if app.challenges.lock().await.remove(challenge_id).is_none() {
+        return Ok(Err(
+            HttpResponse::BadRequest().body("Challenge has already been used")
+        ));
     }
     record_activity(
-        &app,
+        app,
         ActivityKind::ProofAccepted,
-        Some(&proof.challenge_id),
+        Some(challenge_id),
         Some(lease.work_units),
     )
     .await
@@ -966,12 +1066,12 @@ async fn proof_endpoint(
         )))
     })?;
     let mut pool_share_status = "not_pool_qualified".to_string();
-    for (candidate, hash) in &verified_candidates {
+    for (candidate, hash) in verified_candidates {
         if meets_difficulty_target(hash, &lease.pool_job.share_target) {
             record_activity(
-                &app,
+                app,
                 ActivityKind::PoolShareCandidate,
-                Some(&proof.challenge_id),
+                Some(challenge_id),
                 None,
             )
             .await
@@ -996,7 +1096,7 @@ async fn proof_endpoint(
             }
             let pending_record = ShareLedgerRecord {
                 share_id: share_id.clone(),
-                challenge_id: proof.challenge_id.clone(),
+                challenge_id: challenge_id.to_string(),
                 lease_id: lease.lease_id.clone(),
                 job_id: lease.pool_job.job.job_id.clone(),
                 nonce: candidate.nonce,
@@ -1031,9 +1131,9 @@ async fn proof_endpoint(
                         Ok(Ok(Ok(true))) => {
                             pool_share_status = "pool_accepted".to_string();
                             record_activity(
-                                &app,
+                                app,
                                 ActivityKind::PoolShareAccepted,
-                                Some(&proof.challenge_id),
+                                Some(challenge_id),
                                 None,
                             )
                             .await
@@ -1046,9 +1146,9 @@ async fn proof_endpoint(
                         Ok(Ok(Ok(false))) => {
                             pool_share_status = "pool_rejected".to_string();
                             record_activity(
-                                &app,
+                                app,
                                 ActivityKind::PoolShareRejected,
-                                Some(&proof.challenge_id),
+                                Some(challenge_id),
                                 None,
                             )
                             .await
@@ -1072,7 +1172,7 @@ async fn proof_endpoint(
                 &app.share_ledger,
                 ShareLedgerRecord {
                     share_id,
-                    challenge_id: proof.challenge_id.clone(),
+                    challenge_id: challenge_id.to_string(),
                     lease_id: lease.lease_id.clone(),
                     job_id: lease.pool_job.job.job_id.clone(),
                     nonce: candidate.nonce,
@@ -1090,47 +1190,29 @@ async fn proof_endpoint(
             })?;
         }
     }
-    let response = issue_access_grant(
-        &app,
-        &proof.challenge_id,
-        &challenge.resource,
-        challenge.required_work_units,
-        pool_share_status,
-    )
-    .await?;
-    Ok(HttpResponse::Ok().json(response))
+    Ok(Ok(pool_share_status))
 }
 
-/// Stores a grant for a new random token. Refused with 503 when the grant
-/// table is full of live grants.
-async fn issue_access_grant(
+/// Stores a grant for a new random token, valid for an hour on `resource`,
+/// and returns the token; `None` when the grant table is full of live grants.
+async fn store_access_grant(
     app: &AppState,
     challenge_id: &str,
     resource: &str,
     work_units: u64,
-    pool_share: String,
-) -> Result<TokenResponse, Error> {
+) -> Result<Option<AccessToken>, Error> {
     let token = issue_access_token().map_err(|error| Error::from(io::Error::other(error)))?;
-    app.access_tokens
-        .lock()
-        .await
-        .insert(
-            token.token_id.clone(),
-            AccessGrant {
-                resource: resource.to_string(),
-                expires_at: token.expires_at,
-                challenge_id: challenge_id.to_string(),
-                work_units,
-            },
-            Utc::now(),
-        )
-        .map_err(|_| actix_web::error::ErrorServiceUnavailable(AT_CAPACITY))?;
-    Ok(TokenResponse {
-        token: token.token_id,
-        credits_remaining: ACCESS_TOKEN_USES,
-        expiry: token.expires_at.to_rfc3339(),
-        pool_share,
-    })
+    let stored = app.access_tokens.lock().await.insert(
+        token.token_id.clone(),
+        AccessGrant {
+            resource: resource.to_string(),
+            expires_at: token.expires_at,
+            challenge_id: challenge_id.to_string(),
+            work_units,
+        },
+        Utc::now(),
+    );
+    Ok(stored.ok().map(|()| token))
 }
 
 async fn protected_endpoint(
@@ -1826,20 +1908,12 @@ mod protected_access_tests {
         AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0 Safari/537.36";
     const CONTACT: &str = "resource=%2Fforms%2Fcontact";
 
-    async fn issue(
-        state: &web::Data<AppState>,
-        challenge_id: &str,
-        resource: &str,
-    ) -> TokenResponse {
-        issue_access_grant(
-            state.get_ref(),
-            challenge_id,
-            resource,
-            12,
-            "not_pool_qualified".to_string(),
-        )
-        .await
-        .unwrap()
+    async fn issue(state: &web::Data<AppState>, challenge_id: &str, resource: &str) -> String {
+        store_access_grant(state.get_ref(), challenge_id, resource, 12)
+            .await
+            .unwrap()
+            .expect("room for the grant")
+            .token_id
     }
 
     async fn protected(
@@ -1922,9 +1996,7 @@ mod protected_access_tests {
     async fn missing_or_empty_resource_is_a_bad_request_and_keeps_the_token() {
         let dir = ScratchDir::new("protected-resource");
         let state = test_state(&dir, None);
-        let token = issue(&state, "challenge-resource", "/article/test")
-            .await
-            .token;
+        let token = issue(&state, "challenge-resource", "/article/test").await;
         for query in [format!("token={token}"), format!("token={token}&resource=")] {
             let (status, body) = protected(&state, &query, &[]).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
@@ -1942,9 +2014,8 @@ mod protected_access_tests {
     async fn a_token_authorizes_exactly_one_protected_call() {
         let dir = ScratchDir::new("protected-once");
         let state = test_state(&dir, None);
-        let issued = issue(&state, "challenge-once", "/forms/contact").await;
-        assert_eq!(issued.credits_remaining, 1, "a token is issued for one use");
-        let query = format!("token={}&{CONTACT}", issued.token);
+        let token = issue(&state, "challenge-once", "/forms/contact").await;
+        let query = format!("token={token}&{CONTACT}");
 
         let (status, body) = protected(&state, &query, &[]).await;
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -1958,7 +2029,7 @@ mod protected_access_tests {
             );
         }
         assert!(
-            !state.access_tokens.lock().await.contains_key(&issued.token),
+            !state.access_tokens.lock().await.contains_key(&token),
             "a used token's record is removed"
         );
     }
@@ -1967,9 +2038,7 @@ mod protected_access_tests {
     async fn wrong_resource_is_forbidden_and_does_not_consume_the_token() {
         let dir = ScratchDir::new("protected-scope");
         let state = test_state(&dir, None);
-        let token = issue(&state, "challenge-scope", "/forms/contact")
-            .await
-            .token;
+        let token = issue(&state, "challenge-scope", "/forms/contact").await;
         for _ in 0..2 {
             let (status, _) = protected(
                 &state,
@@ -2002,9 +2071,7 @@ mod protected_access_tests {
             let (status, body) = protected(&state, CONTACT, &headers).await;
             assert_token_required(status, &body, authorization);
 
-            let token = issue(&state, &format!("challenge-auth-{index}"), "/forms/contact")
-                .await
-                .token;
+            let token = issue(&state, &format!("challenge-auth-{index}"), "/forms/contact").await;
             let query = format!("token={token}&{CONTACT}");
             assert_eq!(protected(&state, &query, &headers).await.0, StatusCode::OK);
             assert_eq!(
@@ -2052,9 +2119,7 @@ mod protected_access_tests {
             0
         );
 
-        let token = issue(&state, "challenge-with-key", "/forms/contact")
-            .await
-            .token;
+        let token = issue(&state, "challenge-with-key", "/forms/contact").await;
         let query = format!("token={token}&{CONTACT}");
         assert_eq!(
             protected(&state, &query, &key).await.0,
@@ -2121,9 +2186,7 @@ mod protected_access_tests {
             "a 4096-byte token is looked up"
         );
 
-        let token = issue(&state, "challenge-limits", "/forms/contact")
-            .await
-            .token;
+        let token = issue(&state, "challenge-limits", "/forms/contact").await;
         let (status, _) = submit(ok(120), ok(254), ok(5000), token).await;
         assert_eq!(status, StatusCode::ACCEPTED, "every field at its limit");
     }
@@ -2132,9 +2195,7 @@ mod protected_access_tests {
     async fn a_token_check_does_not_hold_the_grant_table_while_its_record_is_written() {
         let dir = ScratchDir::new("protected-unlocked");
         let (state, gate) = gated_test_state(&dir);
-        let token = issue(&state, "challenge-unlocked", "/forms/contact")
-            .await
-            .token;
+        let token = issue(&state, "challenge-unlocked", "/forms/contact").await;
         let query = format!("token={token}&{CONTACT}");
         let check = protected(&state, &query, &[]);
         tokio::pin!(check);
@@ -2172,9 +2233,7 @@ mod protected_access_tests {
     async fn a_token_is_single_use_across_the_protected_route_and_the_demo_form() {
         let dir = ScratchDir::new("protected-form");
         let state = test_state(&dir, None);
-        let form_token = issue(&state, "challenge-form-a", "/forms/contact")
-            .await
-            .token;
+        let form_token = issue(&state, "challenge-form-a", "/forms/contact").await;
         assert_eq!(
             submit_contact_form(&state, &form_token).await,
             StatusCode::ACCEPTED
@@ -2190,9 +2249,7 @@ mod protected_access_tests {
             StatusCode::UNAUTHORIZED
         );
 
-        let token = issue(&state, "challenge-form-b", "/forms/contact")
-            .await
-            .token;
+        let token = issue(&state, "challenge-form-b", "/forms/contact").await;
         assert_eq!(
             protected(&state, &format!("token={token}&{CONTACT}"), &[])
                 .await
@@ -2209,12 +2266,8 @@ mod protected_access_tests {
     async fn issued_tokens_are_random_and_do_not_reveal_the_challenge() {
         let dir = ScratchDir::new("protected-random-token");
         let state = test_state(&dir, None);
-        let first = issue(&state, "challenge-visible", "/forms/contact")
-            .await
-            .token;
-        let second = issue(&state, "challenge-visible", "/forms/contact")
-            .await
-            .token;
+        let first = issue(&state, "challenge-visible", "/forms/contact").await;
+        let second = issue(&state, "challenge-visible", "/forms/contact").await;
         assert_ne!(first, second, "two tokens for one challenge must differ");
         for token in [&first, &second] {
             assert_eq!(token.len(), 64, "256 random bits as hex: {token}");
@@ -2239,9 +2292,7 @@ mod protected_access_tests {
                 .form_submissions_verified
                 .load(Ordering::Relaxed)
         };
-        let token = issue(&state, "challenge-counted", "/forms/contact")
-            .await
-            .token;
+        let token = issue(&state, "challenge-counted", "/forms/contact").await;
 
         for (query, headers) in [
             (CONTACT.to_string(), vec![]),
@@ -2482,6 +2533,11 @@ mod access_proof_replay_tests {
         let (status, body) = prove(&state, &lease, &solutions).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(body["token"].is_string());
+        assert!(body["expiry"].is_string());
+        assert_eq!(
+            body["credits_remaining"], 1,
+            "a token is issued for one use"
+        );
     }
 
     #[actix_web::test]
@@ -2570,6 +2626,51 @@ mod access_proof_replay_tests {
         state.pool_runtime_config.write().await.required_work_units = 8;
         serve_job(&state, 1, true).await;
         state
+    }
+
+    #[actix_web::test]
+    async fn each_share_qualifying_solution_is_forwarded_and_the_pool_answer_reported() {
+        let dir = ScratchDir::new("shares-forwarded");
+        let state = replay_state(&dir).await;
+        // A share target every hash meets, so each solution is also a share.
+        {
+            let mut pool = state.stratum_pool.lock().await;
+            let mut job = pool.current_job.clone().unwrap();
+            job.share_target = [0xff; 32];
+            pool.jobs.insert(job.job.job_id.clone(), job.clone());
+            pool.current_job = Some(job);
+        }
+        let analytics = &state.analytics;
+        let count = |counter: &std::sync::atomic::AtomicU64| counter.load(Ordering::Relaxed);
+        let answers: [(Result<bool, String>, &str, &std::sync::atomic::AtomicU64); 3] = [
+            (Ok(true), "pool_accepted", &analytics.pool_shares_accepted),
+            (Ok(false), "pool_rejected", &analytics.pool_shares_rejected),
+            (
+                Err("stale job".to_string()),
+                "submission_error: stale job",
+                &analytics.pool_candidates,
+            ),
+        ];
+        for (answer, status_text, counter) in answers {
+            let (sender, mut submissions) =
+                tokio::sync::mpsc::channel::<stratum_client::ShareSubmission>(64);
+            state.stratum_pool.lock().await.submit_sender = Some(sender);
+            tokio::spawn(async move {
+                while let Some(submission) = submissions.recv().await {
+                    let _ = submission.response.send(answer.clone());
+                }
+            });
+            let (_, lease) = new_lease(&state).await;
+            let candidates_before = count(&analytics.pool_candidates);
+            let counted_before = count(counter);
+
+            let (status, body) = prove(&state, &lease, &solve(&lease, 0)).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert!(body["token"].is_string(), "{body}");
+            assert_eq!(body["pool_share"], status_text, "{body}");
+            assert_eq!(count(&analytics.pool_candidates), candidates_before + 16);
+            assert_eq!(count(counter), counted_before + 16, "{status_text}");
+        }
     }
 
     #[actix_web::test]

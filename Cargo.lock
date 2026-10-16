@@ -261,7 +261,7 @@ dependencies = [
 
 [[package]]
 name = "c2a-challenger"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "sha2",
 ]
@@ -309,7 +309,7 @@ dependencies = [
 
 [[package]]
 name = "compute-to-access-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "chrono",
  "getrandom 0.2.17",
@@ -322,7 +322,7 @@ dependencies = [
 
 [[package]]
 name = "compute-to-access-server"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "actix-rt",
  "actix-web",

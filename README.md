@@ -73,7 +73,7 @@ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8081/admin/config `
 
 Don't use a production payout address or production secrets for local testing. To test without a real pool, point `C2A_POOL_HOST` at a local Stratum endpoint and set `C2A_POOL_TLS=false`.
 
-The demo page has two modes. The default mode verifies the form with one access proof and shows progress. It also has a separate, opt-in pool search, which keeps searching fresh leases until it is stopped or the pool answers a full-target share. `/browser/index.html?mode=minimal` hides the panels and submits the form only after the pool accepts a share. At real pool difficulty a browser is not expected to find one in practical time. Each pool-search batch earns an access token for `/pool/share-search` that is never used and holds a token slot for its hour, so keep the demo page to local testing.
+The demo page has two modes. The default mode verifies the form with one access proof and shows progress. It also has a separate, opt-in pool search, which keeps searching fresh leases until it is stopped or the pool answers a full-target share. Each pool-search batch is a proof for `/pool/share-search`, which the Challenger checks, records and forwards like any other but which earns no token. `/browser/index.html?mode=minimal` hides the panels and submits the form only after the pool accepts a share. At real pool difficulty a browser is not expected to find one in practical time. The minimal mode's batches are `/pool/share-search` proofs as well; once the pool accepts a share, the worker that found it solves one ordinary `/forms/contact` proof, and that proof's token submits the form. Both modes ask for their challenges from the browser, which a site keeps server to server ([DOCUMENTATION.md](./DOCUMENTATION.md) section 9), so the demo page is for local testing.
 
 ## Testing
 
@@ -86,12 +86,12 @@ node --test --test-timeout=120000 --test-force-exit "tests/regression/*.test.mjs
 ```
 
 The Rust tests live beside the code in `#[cfg(test)]` modules:
-- **Server (`server/src/main.rs`):** the `/protected` contract and token model, proof replay, startup secrets, the share ledger. `server/src/activity.rs` covers the activity ledger and its group commit, `server/src/ledger.rs` the ledger files; `server/src/hardening_tests.rs` covers the capacity limits, lease ownership, the JSON body cap and `C2A_POOL_TLS`; `server/src/expiring.rs` the bounded tables.
-- **Stratum client (`server/src/stratum_client.rs`):** lease allocation, the pool handshake and line limits, share submission against a local fake pool.
+- **Server (`server/src/main.rs`):** the `/protected` contract and token model, proof replay, share forwarding and the pool's answers, startup secrets, the share ledger. `server/src/activity.rs` covers the activity ledger and its group commit, `server/src/ledger.rs` the ledger files; `server/src/hardening_tests.rs` covers the capacity limits (remembered solutions included), lease ownership and the 8 leases per challenge, the token slot a proof holds, pool-search proofs, the JSON body cap and `C2A_POOL_TLS`; `server/src/expiring.rs` the bounded tables.
+- **Stratum client (`server/src/stratum_client.rs`):** lease allocation and the narrow-extranonce2 warning, the remembered solutions and their cap, the pool handshake and line limits, share submission against a local fake pool.
 - **Core crate:** challenges, tokens, header reconstruction, `mining.notify` parsing.
 - **WASM crate:** the search loop, held to a straightforward `sha2` search over random work.
 
-The Node tests check that the browser worker honours the server's 60-second work window, that both solver builds return exactly what a one-hash-at-a-time SHA-256d search returns (the Rust tests run natively, so this is where the SIMD build is tested), and that the worker picks the SIMD build, falls back to the scalar one, produces a proof that verifies, and stops on a cancel.
+The Node tests check that the browser worker honours the server's 60-second work window, that the demo page's minimal mode searches with token-free batches and asks for one form challenge only once the pool accepts a share, that both solver builds return exactly what a one-hash-at-a-time SHA-256d search returns (the Rust tests run natively, so this is where the SIMD build is tested), and that the worker picks the SIMD build, falls back to the scalar one, produces a proof that verifies, and stops on a cancel.
 
 Mutation testing uses `cargo-mutants`; `.cargo/mutants.toml` lists the excluded mutants and why. On Windows pass `--gitignore true` so that ignored folders, which can hold symlinks, are not copied:
 
@@ -109,7 +109,7 @@ Run the Challenger on the same host as the website it protects, behind it, so th
 2. `docker compose up --build -d`, then check `docker compose ps`; the health check polls `/api/pool`.
 3. Give the site the Challenger's loopback URL and the same `C2A_API_KEY`, then save a payout address through `POST /admin/config`. Saving the address starts the pool connection.
 
-Never expose the Challenger port beyond loopback. `/metrics`, `/api/pool` and `/api/job` are unauthenticated, and the challenge, lease and proof endpoints have no rate limiting of their own. The Challenger caps its tables (50,000 live challenges, 20,000 live leases, 50,000 unused tokens, 64 KiB JSON bodies) and answers `503` when full, which the site should treat as unavailable. The solutions it remembers against replay are not capped and grow with accepted proofs until the next block, so the rate limiting belongs to the site in front. Browsers need only `POST /api/lease`, `POST /api/proof` and the solver files under `/browser/`; [DOCUMENTATION.md](./DOCUMENTATION.md) section 9 lists what a site should forward and what stays server to server.
+Never expose the Challenger port beyond loopback. `/metrics`, `/api/pool` and `/api/job` are unauthenticated, and the challenge, lease and proof endpoints have no rate limiting of their own. The Challenger caps its tables (50,000 live challenges, 20,000 live leases, 50,000 unused tokens, 800,000 solutions remembered against replay, 64 KiB JSON bodies) and answers `503` when one is full, which the site should treat as unavailable; a challenge gets at most 8 leases. The caps bound memory, not request rates, so the rate limiting belongs to the site in front. Browsers need only `POST /api/lease`, `POST /api/proof` and the solver files under `/browser/`; [DOCUMENTATION.md](./DOCUMENTATION.md) section 9 lists what a site should forward and what stays server to server.
 
 ## Licence
 
